@@ -3,12 +3,12 @@ use std::{collections::HashMap, os::fd::AsFd};
 use crate::{
     PortalResponse,
     remotedesktop::{
-        CursorPosition, EIS_SERVER, EisServerMsg, REMOTE_SESSIONS, RemoteControl, RemoteInfo,
-        RemoteSessionData, Zone, append_remote_session, disable_eis_listener, enable_eis_listener,
-        get_monitor_info_from_socket,
+        CursorPosition, EIS_SERVER, EisServerMsg, REMOTE_SESSIONS, RemoteAuthorization,
+        RemoteControl, RemoteInfo, RemoteSessionData, Zone, append_remote_session,
+        disable_eis_listener, enable_eis_listener, get_monitor_info_from_socket,
     },
     request::RequestInterface,
-    session::{DeviceType, Session, SessionType, append_session},
+    session::{DeviceType, PersistMode, Session, SessionType, SourceType, append_session},
 };
 use enumflags2::BitFlags;
 use reis::eis;
@@ -153,6 +153,7 @@ impl InputCapture {
         }
         let connection = libwayshot::WayshotConnection::new().unwrap();
         let RemoteInfo {
+            output_name,
             width,
             height,
             x,
@@ -186,6 +187,16 @@ impl InputCapture {
                 width: width as u32,
                 height: height as u32,
             }],
+            RemoteAuthorization::new(
+                output_name,
+                capabilities,
+                false,
+                false,
+                SourceType::Monitor.into(),
+                false,
+                PersistMode::DoNot,
+            ),
+            PersistMode::DoNot,
         ))
         .await;
         Ok(PortalResponse::Success(CreateSessionRet {
@@ -241,22 +252,30 @@ impl InputCapture {
     }
 
     #[zbus(name = "ConnectToEIS")]
-    fn connect_to_eis(
+    async fn connect_to_eis(
         &self,
         session_handle: ObjectPath<'_>,
         _app_id: &str,
         _options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<Fd<'_>> {
+        let session_key = session_handle.to_string();
+        let remote_sessions = REMOTE_SESSIONS.lock().await;
+        let devices = remote_sessions
+            .iter()
+            .find(|session| session.session_handle == session_key)
+            .map(RemoteSessionData::devices)
+            .ok_or_else(|| {
+                zbus::Error::Failure("input capture session is not started".to_string())
+            })?;
+        drop(remote_sessions);
+
         let listener = eis::Listener::bind_auto()
             .map_err(|e| zbus::Error::Failure(format!("Failed to create EIS listener: {}", e)))?;
 
         let fd = io::dup(listener.as_fd()).map_err(|e| zbus::Error::Failure(e.to_string()))?;
         EIS_SERVER
             .0
-            .send(EisServerMsg::NewListener(
-                listener,
-                session_handle.to_string(),
-            ))
+            .send(EisServerMsg::NewListener(listener, session_key, devices))
             .unwrap();
 
         Ok(Fd::from(fd))

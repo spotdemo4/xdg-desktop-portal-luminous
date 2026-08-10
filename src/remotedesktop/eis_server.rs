@@ -5,9 +5,11 @@ use calloop::{
 use enumflags2::BitFlags;
 use reis::{
     calloop::{EisListenerSource, EisRequestSource, EisRequestSourceEvent},
-    eis::{self, device::DeviceType},
+    eis::{self, device::DeviceType as EisDeviceType},
     request::{Connection, DeviceCapability, EisRequest},
 };
+
+use crate::session::DeviceType as PortalDeviceType;
 use std::{
     collections::HashMap,
     io,
@@ -18,10 +20,11 @@ use std::{
 
 #[derive(Default)]
 struct ContextState {
+    capabilities: BitFlags<DeviceCapability>,
     seat: Option<reis::request::Seat>,
     device_keyboard: Option<reis::request::Device>,
     device_pointer: Option<reis::request::Device>,
-    device_pointer_absolute: Option<reis::request::Device>,
+    pointer_capabilities: BitFlags<DeviceCapability>,
     device_touch: Option<reis::request::Device>,
     sequence: u32,
 }
@@ -37,11 +40,14 @@ impl ContextState {
                 return calloop::PostAction::Remove;
             }
             EisRequest::Bind(request) => {
-                let capabilities = request.capabilities;
+                let capabilities = request.capabilities & self.capabilities;
 
-                if self.device_keyboard.is_none()
-                    && (capabilities & DeviceCapability::Keyboard).bits() != 0
-                {
+                let keyboard_enabled = capabilities.contains(DeviceCapability::Keyboard);
+                if !keyboard_enabled {
+                    if let Some(device) = self.device_keyboard.take() {
+                        device.remove();
+                    }
+                } else if self.device_keyboard.is_none() {
                     self.device_keyboard = Some(add_device(
                         "keyboard",
                         BitFlags::from_flag(DeviceCapability::Keyboard),
@@ -52,42 +58,37 @@ impl ContextState {
                     ));
                 }
 
-                if self.device_pointer.is_none()
-                    && (capabilities & DeviceCapability::Pointer).bits() != 0
-                {
-                    self.device_pointer = Some(add_device(
-                        "pointer",
-                        DeviceCapability::Pointer
-                            | DeviceCapability::Button
-                            | DeviceCapability::Scroll,
-                        |_| {},
-                        &request.seat,
-                        connection,
-                        &mut self.sequence,
-                    ));
+                let pointer_capabilities = capabilities
+                    & (DeviceCapability::Pointer
+                        | DeviceCapability::PointerAbsolute
+                        | DeviceCapability::Button
+                        | DeviceCapability::Scroll);
+                if pointer_capabilities != self.pointer_capabilities {
+                    if let Some(device) = self.device_pointer.take() {
+                        device.remove();
+                    }
+                    self.pointer_capabilities = pointer_capabilities;
+                    if !pointer_capabilities.is_empty() {
+                        self.device_pointer = Some(add_device(
+                            "pointer",
+                            pointer_capabilities,
+                            |_| {},
+                            &request.seat,
+                            connection,
+                            &mut self.sequence,
+                        ));
+                    }
                 }
 
-                if self.device_touch.is_none()
-                    && (capabilities & DeviceCapability::Touch).bits() != 0
-                {
+                let touch_enabled = capabilities.contains(DeviceCapability::Touch);
+                if !touch_enabled {
+                    if let Some(device) = self.device_touch.take() {
+                        device.remove();
+                    }
+                } else if self.device_touch.is_none() {
                     self.device_touch = Some(add_device(
                         "touch",
                         BitFlags::from_flag(DeviceCapability::Touch),
-                        |_| {},
-                        &request.seat,
-                        connection,
-                        &mut self.sequence,
-                    ));
-                }
-
-                if self.device_pointer_absolute.is_none()
-                    && (capabilities & DeviceCapability::PointerAbsolute).bits() != 0
-                {
-                    self.device_pointer_absolute = Some(add_device(
-                        "pointer-abs",
-                        DeviceCapability::PointerAbsolute
-                            | DeviceCapability::Button
-                            | DeviceCapability::Scroll,
                         |_| {},
                         &request.seat,
                         connection,
@@ -112,7 +113,7 @@ fn add_device(
 ) -> reis::request::Device {
     let device = seat.add_device(
         Some(name),
-        DeviceType::Virtual,
+        EisDeviceType::Virtual,
         capabilities,
         before_done_cb,
     );
@@ -122,6 +123,23 @@ fn add_device(
         device.start_emulating(*sequence);
     }
     device
+}
+
+fn device_capabilities(devices: BitFlags<PortalDeviceType>) -> BitFlags<DeviceCapability> {
+    let mut capabilities = BitFlags::empty();
+    if devices.contains(PortalDeviceType::Keyboard) {
+        capabilities |= DeviceCapability::Keyboard;
+    }
+    if devices.contains(PortalDeviceType::Pointer) {
+        capabilities |= DeviceCapability::Pointer
+            | DeviceCapability::PointerAbsolute
+            | DeviceCapability::Scroll
+            | DeviceCapability::Button;
+    }
+    if devices.contains(PortalDeviceType::TouchScreen) {
+        capabilities |= DeviceCapability::Touch;
+    }
+    capabilities
 }
 
 struct State {
@@ -135,6 +153,7 @@ impl State {
         &mut self,
         context: eis::Context,
         session_handle: String,
+        devices: BitFlags<PortalDeviceType>,
     ) -> io::Result<calloop::PostAction> {
         tracing::info!(
             "New connection for session {}: {:?}",
@@ -143,7 +162,10 @@ impl State {
         );
 
         let source = EisRequestSource::new(context, 1);
-        let mut context_state = ContextState::default();
+        let mut context_state = ContextState {
+            capabilities: device_capabilities(devices),
+            ..Default::default()
+        };
         let session_handle_clone = session_handle.clone();
         self.handle
             .insert_source(source, move |event, connected_state, state| {
@@ -175,15 +197,7 @@ impl State {
     ) -> calloop::PostAction {
         match event {
             EisRequestSourceEvent::Connected => {
-                let seat = connection.add_seat(
-                    Some("default"),
-                    DeviceCapability::Pointer
-                        | DeviceCapability::PointerAbsolute
-                        | DeviceCapability::Keyboard
-                        | DeviceCapability::Touch
-                        | DeviceCapability::Scroll
-                        | DeviceCapability::Button,
-                );
+                let seat = connection.add_seat(Some("default"), context_state.capabilities);
 
                 context_state.seat = Some(seat);
             }
@@ -280,7 +294,7 @@ impl State {
 
 #[allow(clippy::enum_variant_names)]
 pub enum EisServerMsg {
-    NewListener(eis::Listener, String),
+    NewListener(eis::Listener, String, BitFlags<PortalDeviceType>),
     StopListener(String),
     ActiveListener(String),
     RemoveListener(String),
@@ -351,7 +365,7 @@ pub fn start() -> (Sender<EisServerMsg>, Receiver<InputEvent>) {
         let _ = handle.insert_source(msg_channel, |event, _, state| {
             if let calloop::channel::Event::Msg(msg) = event {
                 match msg {
-                    EisServerMsg::NewListener(listener, session_handle) => {
+                    EisServerMsg::NewListener(listener, session_handle, devices) => {
                         let listener_source = EisListenerSource::new(listener);
                         let session_handle_2 = session_handle.clone();
                         let token = state
@@ -359,7 +373,11 @@ pub fn start() -> (Sender<EisServerMsg>, Receiver<InputEvent>) {
                             .insert_source(
                                 listener_source,
                                 move |context, (), state: &mut State| {
-                                    state.handle_new_connection(context, session_handle.clone())
+                                    state.handle_new_connection(
+                                        context,
+                                        session_handle.clone(),
+                                        devices,
+                                    )
                                 },
                             )
                             .unwrap();
@@ -395,4 +413,28 @@ pub fn start() -> (Sender<EisServerMsg>, Receiver<InputEvent>) {
     });
 
     (tx, input_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eis_capabilities_match_authorized_devices() {
+        let keyboard = device_capabilities(PortalDeviceType::Keyboard.into());
+        assert!(keyboard.contains(DeviceCapability::Keyboard));
+        assert!(!keyboard.contains(DeviceCapability::Pointer));
+        assert!(!keyboard.contains(DeviceCapability::Touch));
+
+        let pointer = device_capabilities(PortalDeviceType::Pointer.into());
+        assert!(pointer.contains(DeviceCapability::Pointer));
+        assert!(pointer.contains(DeviceCapability::PointerAbsolute));
+        assert!(pointer.contains(DeviceCapability::Button));
+        assert!(pointer.contains(DeviceCapability::Scroll));
+        assert!(!pointer.contains(DeviceCapability::Keyboard));
+
+        let touch = device_capabilities(PortalDeviceType::TouchScreen.into());
+        assert!(touch.contains(DeviceCapability::Touch));
+        assert!(!touch.contains(DeviceCapability::Pointer));
+    }
 }
